@@ -456,6 +456,33 @@ def find_moonrise(t_date, topos, tz_offset, elevation_m=0.0):
 
 
 # ──────────────────────────────────────────────
+# Crescent Type Detection
+# ──────────────────────────────────────────────
+
+def detect_crescent_type(date_year, date_month, date_day, tz_offset=0.0):
+    """
+    Auto-detect whether the crescent is waxing or waning on the given date.
+
+    Computes the Moon's ecliptic longitude relative to the Sun at noon local time.
+    If Moon is 0-180° ahead of Sun (eastward), it's waxing (new/evening crescent).
+    If Moon is 180-360° ahead of Sun, it's waning (old/morning crescent).
+
+    Returns:
+        'waxing' or 'waning'
+    """
+    t = _ts.utc(date_year, date_month, date_day, 12.0 - tz_offset)
+
+    sun_apparent = _earth.at(t).observe(_sun).apparent()
+    moon_apparent = _earth.at(t).observe(_moon).apparent()
+
+    _, sun_lon, _ = sun_apparent.ecliptic_latlon(epoch='date')
+    _, moon_lon, _ = moon_apparent.ecliptic_latlon(epoch='date')
+
+    diff = (moon_lon.degrees - sun_lon.degrees) % 360.0
+    return 'waxing' if diff < 180.0 else 'waning'
+
+
+# ──────────────────────────────────────────────
 # Conjunction Finding
 # ──────────────────────────────────────────────
 
@@ -515,8 +542,10 @@ def find_conjunction_before_date(date_year, date_month, date_day, tz_offset=0.0)
     Returns:
         Skyfield time of the conjunction
     """
-    # Search from 35 days before to the observation date
-    t_obs = _ts.utc(date_year, date_month, date_day, 12 - tz_offset)
+    # Search from 35 days before to the end of the observation day (local midnight).
+    # Using end-of-day ensures a conjunction occurring any time on the observation
+    # date (including afternoon/evening) is captured as the "previous new moon".
+    t_obs = _ts.utc(date_year, date_month, date_day, 24 - tz_offset)
     t_start = _ts.utc(date_year, date_month, date_day - 35, 0)
 
     times, phases = almanac.find_discrete(t_start, t_obs, almanac.moon_phases(_eph))
@@ -528,6 +557,27 @@ def find_conjunction_before_date(date_year, date_month, date_day, tz_offset=0.0)
             last_conjunction = ti
 
     return last_conjunction
+
+
+def find_next_conjunction_after_date(date_year, date_month, date_day, tz_offset=0.0):
+    """
+    Find the first geocentric conjunction (new moon) after the given date.
+
+    Used to determine the upcoming new moon when the crescent is waning.
+
+    Returns:
+        Skyfield time of the next conjunction
+    """
+    t_obs = _ts.utc(date_year, date_month, date_day, 12 - tz_offset)
+    t_end = _ts.utc(date_year, date_month, date_day + 35, 0)
+
+    times, phases = almanac.find_discrete(t_obs, t_end, almanac.moon_phases(_eph))
+
+    for ti, phase in zip(times, phases):
+        if phase == 0:
+            return ti
+
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -848,6 +898,9 @@ def compute_all(latitude, longitude, elevation, tz_offset,
         date_year, date_month, date_day, tz_offset
     )
     t_conjunction_topo = find_topocentric_conjunction(t_conjunction_geo, observer)
+    t_next_conjunction_geo = find_next_conjunction_after_date(
+        date_year, date_month, date_day, tz_offset
+    )
 
     # ── 3. Determine calculation time ──
     # Accurate Times calculates positions at moonset (new) or moonrise (old)
@@ -924,43 +977,55 @@ def compute_all(latitude, longitude, elevation, tz_offset,
         lag_total, lag_hms = compute_lag_time(t_moonrise, t_sunrise)
         t_best = compute_best_time(None, None, crescent_type, t_sunrise, t_moonrise)
 
-    # ── 7. Compute positions at Best Time (always topocentric for visibility criteria) ──
-    sun_best_topo = sun_position_topocentric(t_best, observer)
-    moon_best_topo = moon_position_topocentric(t_best, observer)
+    # ── 7. Compute positions at sunset/sunrise for all visibility criteria ──
+    # All three criteria (Odeh, Yallop, SAAO) are evaluated at the moment
+    # the Sun sets (waxing crescent) or rises (waning crescent).
+    t_criteria_ref = t_sunset if crescent_type == 'waxing' else t_sunrise
+    if t_criteria_ref is not None:
+        sun_crit_topo = sun_position_topocentric(t_criteria_ref, observer)
+        moon_crit_topo = moon_position_topocentric(t_criteria_ref, observer)
 
-    best_moon_alt = moon_best_topo['altitude_deg']
-    best_moon_az = moon_best_topo['azimuth_deg']
-    best_sun_alt = sun_best_topo['altitude_deg']
-    best_sun_az = sun_best_topo['azimuth_deg']
+        crit_moon_alt = moon_crit_topo['altitude_deg']
+        crit_moon_az = moon_crit_topo['azimuth_deg']
+        crit_sun_alt = sun_crit_topo['altitude_deg']
+        crit_sun_az = sun_crit_topo['azimuth_deg']
 
-    best_arcv_topo = compute_arcv(best_moon_alt, best_sun_alt)
-    best_elongation_topo = compute_elongation(
-        sun_best_topo['ra_hours'], sun_best_topo['dec_degrees'],
-        moon_best_topo['ra_hours'], moon_best_topo['dec_degrees']
-    )
-    best_semi_diameter_topo = moon_best_topo['semi_diameter_deg']
-    best_crescent_width_topo = compute_crescent_width(
-        best_semi_diameter_topo, best_elongation_topo
-    )
+        crit_arcv_topo = compute_arcv(crit_moon_alt, crit_sun_alt)
+        crit_elongation_topo = compute_elongation(
+            sun_crit_topo['ra_hours'], sun_crit_topo['dec_degrees'],
+            moon_crit_topo['ra_hours'], moon_crit_topo['dec_degrees']
+        )
+        crit_semi_diameter_topo = moon_crit_topo['semi_diameter_deg']
+        crit_crescent_width_topo = compute_crescent_width(
+            crit_semi_diameter_topo, crit_elongation_topo
+        )
+        crit_daz = compute_daz(crit_sun_az, crit_moon_az)
 
-    # For Yallop: geocentric ARCV at best time
-    moon_geo_best = moon_position_geocentric(t_best)
-    sun_geo_best = sun_position_geocentric(t_best)
-    best_moon_alt_geo, best_moon_az_geo = geocentric_altaz(
-        t_best, latitude, longitude,
-        moon_geo_best['ra_hours'], moon_geo_best['dec_degrees']
-    )
-    best_sun_alt_geo, best_sun_az_geo = geocentric_altaz(
-        t_best, latitude, longitude,
-        sun_geo_best['ra_hours'], sun_geo_best['dec_degrees']
-    )
-    best_arcv_geo = compute_arcv(best_moon_alt_geo, best_sun_alt_geo)
+        # Geocentric ARCV at criteria time (for Yallop)
+        moon_geo_crit = moon_position_geocentric(t_criteria_ref)
+        sun_geo_crit = sun_position_geocentric(t_criteria_ref)
+        crit_moon_alt_geo, _ = geocentric_altaz(
+            t_criteria_ref, latitude, longitude,
+            moon_geo_crit['ra_hours'], moon_geo_crit['dec_degrees']
+        )
+        crit_sun_alt_geo, _ = geocentric_altaz(
+            t_criteria_ref, latitude, longitude,
+            sun_geo_crit['ra_hours'], sun_geo_crit['dec_degrees']
+        )
+        crit_arcv_geo = compute_arcv(crit_moon_alt_geo, crit_sun_alt_geo)
+    else:
+        crit_arcv_topo = None
+        crit_crescent_width_topo = None
+        crit_arcv_geo = None
+        crit_elongation_topo = None
+        crit_daz = None
+        crit_moon_alt = None
 
-    # ── 8. Delta T and Julian Date ──
+    # ── 9. Delta T and Julian Date ──
     delta_t = get_delta_t(t_calc)
     jd = t_calc.tt
 
-    # ── 9. Impossible flag ──
+    # ── 11. Impossible flag ──
     impossible = False
     impossible_reason = None
     if crescent_type == 'waxing':
@@ -978,14 +1043,17 @@ def compute_all(latitude, longitude, elevation, tz_offset,
             impossible = True
             impossible_reason = "Topocentric conjunction occurs after Sunrise"
 
-    # ── 10. Build result dictionary ──
+    # ── 12. Build result dictionary ──
     result = {
         'metadata': {
             'crescent_type': crescent_type,
+            'moon_label': 'New Moon' if crescent_type == 'waxing' else 'Old Moon',
             'coordinate_mode': coordinate_mode,
             'calculation_time_event': 'Moonset' if crescent_type == 'waxing' else 'Moonrise',
             'delta_t': round(delta_t, 2),
             'julian_date': round(jd, 5),
+            'next_new_moon': t_next_conjunction_geo,
+            'previous_new_moon': t_conjunction_geo,
         },
         'timing': {
             'conjunction_geo': t_conjunction_geo,
@@ -1034,11 +1102,13 @@ def compute_all(latitude, longitude, elevation, tz_offset,
             'distance_km': round(distance_km, 2),
         },
         'best_time_data': {
-            'topo_arcv_deg': best_arcv_topo,
-            'topo_crescent_width_deg': best_crescent_width_topo,
-            'topo_crescent_width_arcmin': best_crescent_width_topo * 60.0,
-            'geo_arcv_deg': best_arcv_geo,
-            'topo_elongation_deg': best_elongation_topo,
+            'topo_arcv_deg': crit_arcv_topo,
+            'topo_crescent_width_deg': crit_crescent_width_topo,
+            'topo_crescent_width_arcmin': crit_crescent_width_topo * 60.0 if crit_crescent_width_topo is not None else None,
+            'geo_arcv_deg': crit_arcv_geo,
+            'topo_elongation_deg': crit_elongation_topo,
+            'saao_moon_alt_deg': crit_moon_alt,
+            'saao_daz_deg': crit_daz,
         },
         'impossible': impossible,
         'impossible_reason': impossible_reason,

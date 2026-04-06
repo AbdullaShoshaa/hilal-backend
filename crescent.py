@@ -157,63 +157,100 @@ def yallop_criterion(arcv_geo_deg, W_topo_arcmin, elongation_deg):
     }
 
 
-def saao_criterion(arcv_topo_deg, W_topo_arcmin, daz_topo_deg,
-                    moon_alt_topo_deg, elongation_topo_deg):
+def _saao_thresholds(daz_abs_deg):
+    """
+    Interpolate SAAO DALT1 and DALT2 thresholds from Caldwell & Laney (2001) table.
+
+    DALT1: below this → Not Possible even with optical aid
+    DALT2: above this → Possible (naked eye visible)
+    Between DALT1 and DALT2 → Improbable (optical aid only)
+
+    Table (Caldwell & Laney 2001):
+        |DAZ|  DALT1  DALT2
+          0°    6.3°   8.2°
+          5°    5.9°   7.8°
+         10°    4.9°   6.8°
+         15°    3.8°   5.7°
+         20°    2.6°   4.5°
+    """
+    daz_table  = [0,   5,   10,  15,  20]
+    dalt1_table = [6.3, 5.9, 4.9, 3.8, 2.6]
+    dalt2_table = [8.2, 7.8, 6.8, 5.7, 4.5]
+
+    daz = min(abs(daz_abs_deg), 20.0)  # clamp at 20°
+
+    # Linear interpolation between table points
+    for i in range(len(daz_table) - 1):
+        if daz_table[i] <= daz <= daz_table[i + 1]:
+            t = (daz - daz_table[i]) / (daz_table[i + 1] - daz_table[i])
+            dalt1 = dalt1_table[i] + t * (dalt1_table[i + 1] - dalt1_table[i])
+            dalt2 = dalt2_table[i] + t * (dalt2_table[i + 1] - dalt2_table[i])
+            return dalt1, dalt2
+
+    return dalt1_table[-1], dalt2_table[-1]
+
+
+def saao_criterion(moon_alt_sunset_deg, daz_sunset_deg, elongation_topo_deg):
     """
     Apply the SAAO (South African Astronomical Observatory) criterion.
 
-    Based on Caldwell & Laney (2001). Uses a combination of Moon altitude
-    and other parameters. Simplified two-zone classification.
+    Caldwell & Laney (2001). Uses Moon altitude at sunset (DALT) against
+    two thresholds (DALT1, DALT2) that vary with |DAZ| at sunset.
 
-    The SAAO criterion is less formally published than Odeh/Yallop.
-    In Accurate Times, it provides two zones:
-        Possible (Green): Crescent is visible by naked eye
-        Improbable (Blue): Exceedingly unlikely without telescope
-
-    This implementation follows the general SAAO approach as referenced
-    in the Accurate Times documentation.
+    Zones:
+        Possible:    DALT >= DALT2  → Naked eye visible
+        Improbable:  DALT1 <= DALT < DALT2  → Optical aid only
+        Not Possible: DALT < DALT1  → Not visible even with optical aid
 
     Args:
-        arcv_topo_deg: Topocentric ARCV (degrees)
-        W_topo_arcmin: Topocentric crescent width (arcminutes)
-        daz_topo_deg: Topocentric DAZ (degrees, absolute value used)
-        moon_alt_topo_deg: Topocentric Moon altitude at sunset (degrees)
-        elongation_topo_deg: Topocentric elongation (degrees)
+        moon_alt_sunset_deg: Topocentric Moon altitude at sunset (degrees)
+        daz_sunset_deg: DAZ (Moon azimuth - Sun azimuth) at sunset (degrees)
+        elongation_topo_deg: Topocentric elongation (degrees) for Danjon check
 
     Returns:
         dict with zone and verdict
     """
-    # Danjon limit check
     if elongation_topo_deg < 6.4:
         return {
             'zone': 'Not Possible',
             'verdict': 'Below Danjon limit',
         }
 
-    # SAAO uses a simpler criterion based on the visibility parameters
-    # The exact threshold varies in literature; this follows the common
-    # implementation where visibility depends on ARCV and W combination
-    # Similar to Odeh but with different thresholds
+    if moon_alt_sunset_deg is None or daz_sunset_deg is None:
+        return {
+            'zone': 'Unknown',
+            'verdict': 'Insufficient data for SAAO criterion',
+        }
 
-    # Approximate SAAO boundary:
-    # If the Odeh V >= -0.96 (zone C or better), SAAO says "Possible"
-    # Otherwise "Improbable"
-    V = arcv_topo_deg - _visibility_polynomial(W_topo_arcmin)
+    dalt1, dalt2 = _saao_thresholds(daz_sunset_deg)
 
-    if V >= -0.96:
+    if moon_alt_sunset_deg >= dalt2:
         return {
             'zone': 'Possible',
             'verdict': 'Crescent is visible by naked eye',
+            'dalt': round(moon_alt_sunset_deg, 2),
+            'dalt1': round(dalt1, 2),
+            'dalt2': round(dalt2, 2),
+        }
+    elif moon_alt_sunset_deg >= dalt1:
+        return {
+            'zone': 'Improbable',
+            'verdict': 'Optical aid may be needed; naked eye sighting is unlikely',
+            'dalt': round(moon_alt_sunset_deg, 2),
+            'dalt1': round(dalt1, 2),
+            'dalt2': round(dalt2, 2),
         }
     else:
         return {
-            'zone': 'Improbable',
-            'verdict': 'Seeing the crescent without telescope is exceedingly unlikely',
+            'zone': 'Not Possible',
+            'verdict': 'Not visible even with optical aid',
+            'dalt': round(moon_alt_sunset_deg, 2),
+            'dalt1': round(dalt1, 2),
+            'dalt2': round(dalt2, 2),
         }
 
 
-def evaluate_all_criteria(best_time_data, elongation_topo_deg,
-                          daz_topo_deg=0.0, moon_alt_topo_deg=0.0):
+def evaluate_all_criteria(best_time_data, elongation_topo_deg):
     """
     Evaluate all three visibility criteria.
 
@@ -223,9 +260,9 @@ def evaluate_all_criteria(best_time_data, elongation_topo_deg,
             - topo_crescent_width_arcmin: Topocentric W at Best Time (arcmin)
             - geo_arcv_deg: Geocentric ARCV at Best Time
             - topo_elongation_deg: Topocentric elongation at Best Time
+            - saao_moon_alt_deg: Moon altitude at sunset (for SAAO)
+            - saao_daz_deg: DAZ at sunset (for SAAO)
         elongation_topo_deg: Topocentric elongation (degrees)
-        daz_topo_deg: Topocentric DAZ (degrees) for SAAO
-        moon_alt_topo_deg: Topocentric Moon altitude for SAAO
 
     Returns:
         dict with odeh, yallop, saao results
@@ -234,10 +271,11 @@ def evaluate_all_criteria(best_time_data, elongation_topo_deg,
     W_arcmin = best_time_data['topo_crescent_width_arcmin']
     arcv_geo = best_time_data['geo_arcv_deg']
     elong_topo = best_time_data['topo_elongation_deg']
+    saao_moon_alt = best_time_data.get('saao_moon_alt_deg')
+    saao_daz = best_time_data.get('saao_daz_deg')
 
     return {
         'odeh': odeh_criterion(arcv_topo, W_arcmin, elong_topo),
         'yallop': yallop_criterion(arcv_geo, W_arcmin, elong_topo),
-        'saao': saao_criterion(arcv_topo, W_arcmin, daz_topo_deg,
-                               moon_alt_topo_deg, elong_topo),
+        'saao': saao_criterion(saao_moon_alt, saao_daz, elong_topo),
     }

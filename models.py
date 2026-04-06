@@ -21,10 +21,6 @@ class CrescentRequest(BaseModel):
     elevation: float = Field(default=0.0, ge=0, description="Observer elevation in meters above sea level")
     timezone_offset: float = Field(..., description="Hours offset from UTC (e.g., 3.0 for UTC+3)")
     date: str = Field(..., description="Observation date in YYYY-MM-DD format")
-    crescent_type: Literal['waxing', 'waning'] = Field(
-        default='waxing',
-        description="'waxing' for new/evening crescent, 'waning' for old/morning crescent"
-    )
     coordinate_mode: Literal['geocentric', 'topocentric'] = Field(
         default='geocentric',
         description="Coordinate calculation mode"

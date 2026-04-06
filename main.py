@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
 from models import CrescentRequest
-from astronomy import compute_all
+from astronomy import compute_all, detect_crescent_type
 from crescent import evaluate_all_criteria
 from formatting import (
     format_dms, format_dms_short, format_ra, format_time_local,
@@ -65,6 +65,9 @@ async def crescent_visibility(request: CrescentRequest):
         month = int(date_parts[1])
         day = int(date_parts[2])
 
+        # Auto-detect crescent type from moon phase
+        crescent_type = detect_crescent_type(year, month, day, request.timezone_offset)
+
         # Run the full calculation pipeline
         result = compute_all(
             latitude=request.latitude,
@@ -74,7 +77,7 @@ async def crescent_visibility(request: CrescentRequest):
             date_year=year,
             date_month=month,
             date_day=day,
-            crescent_type=request.crescent_type,
+            crescent_type=crescent_type,
             coordinate_mode=request.coordinate_mode,
             temperature_c=request.refraction.temperature_c,
             pressure_mb=request.refraction.pressure_mb,
@@ -86,8 +89,6 @@ async def crescent_visibility(request: CrescentRequest):
         visibility = evaluate_all_criteria(
             result['best_time_data'],
             result['best_time_data']['topo_elongation_deg'],
-            daz_topo_deg=result['angular']['daz_deg'],
-            moon_alt_topo_deg=result['horizontal']['moon_altitude_deg'],
         )
 
         # Build formatted response
@@ -96,11 +97,14 @@ async def crescent_visibility(request: CrescentRequest):
 
         response = {
             "metadata": {
-                "crescent_type": request.crescent_type,
+                "crescent_type": crescent_type,
+                "moon_label": result['metadata']['moon_label'],
                 "visibility_date": request.date,
                 "coordinate_mode": request.coordinate_mode,
                 "calculation_time_event": result['metadata']['calculation_time_event'],
                 "calculation_time": format_time_local(timing['calculation_time'], tz),
+                "previous_new_moon": format_datetime_local(result['metadata']['previous_new_moon'], tz),
+                "next_new_moon": format_datetime_local(result['metadata']['next_new_moon'], tz),
                 "location": {
                     "name": request.location_name,
                     "latitude": request.latitude,
@@ -182,7 +186,7 @@ async def crescent_visibility(request: CrescentRequest):
             "visibility": {
                 "impossible": result['impossible'],
                 "impossible_reason": result['impossible_reason'],
-                "at_best_time": {
+                "at_sunset": {
                     "topo_ARCV": format_dms_short(result['best_time_data']['topo_arcv_deg']),
                     "topo_ARCV_decimal": round(result['best_time_data']['topo_arcv_deg'], 1),
                     "topo_W": format_dms_short(result['best_time_data']['topo_crescent_width_deg']),
